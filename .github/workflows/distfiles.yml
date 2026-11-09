@@ -1,0 +1,158 @@
+name: Create distfiles
+run-name: agent-browser ${{ inputs.version || 'latest' }}
+on:
+  schedule:
+    - cron: '29 3 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream version without v (empty selects the latest release)
+        required: false
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: distfiles
+  cancel-in-progress: false
+env:
+  PROJECT: agent-browser
+  UPSTREAM: vercel-labs/agent-browser
+  RUSTUP_TOOLCHAIN: stable
+jobs:
+  bundle:
+    if: github.repository == 'gentoo-zh-drafts/agent-browser'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve and check release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_INPUT: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${VERSION_INPUT#v}
+          if [ -z "$version" ]; then
+            tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)
+            version=${tag#v}
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'expected a stable x.y.z version' >&2; exit 1; }
+          tag="v$version"
+          sha=$(gh api "repos/$UPSTREAM/commits/$tag" --jq .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          {
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "ready=false"
+            echo "publish=false"
+          } >> "$GITHUB_OUTPUT"
+          if release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" 2> /tmp/release-error); then
+            prefix="$PROJECT-$version"
+            expected=("$prefix-crates.tar.xz" "$prefix-licenses.json" "$prefix-provenance.json" "$prefix-SHA256SUMS")
+            expected+=("$prefix-web.tar.xz")
+            expected_json=$(printf '%s\n' "${expected[@]}" | jq -Rsc 'split("\n")[:-1]')
+            jq -e --arg sha "$sha" --argjson expected "$expected_json" \
+              '.target_commitish == $sha and (($expected - [.assets[].name]) | length == 0)' <<< "$release" >/dev/null \
+              || { echo 'existing release is incomplete or belongs to another commit; inspect it before retrying' >&2; exit 1; }
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "publish=$(jq -r .draft <<< "$release")" >> "$GITHUB_OUTPUT"
+          elif ! grep -q '(HTTP 404)' /tmp/release-error; then
+            cat /tmp/release-error >&2
+            exit 1
+          fi
+
+      - name: Checkout producer
+        if: steps.release.outputs.ready != 'true'
+        uses: actions/checkout@v7
+        with:
+          path: ci
+          persist-credentials: false
+
+      - name: Checkout upstream commit
+        if: steps.release.outputs.ready != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.release.outputs.sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Setup Rust
+        if: steps.release.outputs.ready != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch locked crates
+        if: steps.release.outputs.ready != 'true'
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bundle/cargo_home"
+          cargo vendor --locked --versioned-dirs --manifest-path cli/Cargo.toml \
+            "$RUNNER_TEMP/bundle/cargo_home/gentoo" > "$RUNNER_TEMP/vendor-config.toml"
+
+      - name: Read pnpm version
+        if: steps.release.outputs.ready != 'true'
+        id: pnpm
+        run: |
+          version=$(jq -er '.packageManager | select(test("^pnpm@[0-9]+\\.[0-9]+\\.[0-9]+$")) | ltrimstr("pnpm@")' source/package.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        if: steps.release.outputs.ready != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm
+        if: steps.release.outputs.ready != 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          version: ${{ steps.pnpm.outputs.version }}
+          run_install: false
+          package_json_file: source/package.json
+
+      - name: Build dashboard
+        if: steps.release.outputs.ready != 'true'
+        working-directory: source
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: |
+          pnpm --filter dashboard... install --frozen-lockfile
+          pnpm --filter dashboard build
+          curl --fail --location --retry 3 \
+            https://raw.githubusercontent.com/google/fonts/main/ofl/geist/OFL.txt -o Geist-OFL.txt
+
+      - name: Package and validate bundles
+        if: steps.release.outputs.ready != 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          python3 ci/scripts/bundle.py "$PROJECT" "$VERSION" "$SOURCE_SHA" source "$RUNNER_TEMP/bundle" out
+          cd out
+          sha256sum -c "$PROJECT-$VERSION-SHA256SUMS"
+          tar -tf "$PROJECT-$VERSION-crates.tar.xz" > "$RUNNER_TEMP/crate-list"
+          grep -q '^cargo_home/gentoo/[^/]*/\.cargo-checksum.json$' "$RUNNER_TEMP/crate-list"
+
+      - name: Upload immutable release
+        if: steps.release.outputs.ready != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --draft \
+            --title "v$VERSION" --notes "Gentoo build inputs from $UPSTREAM@$SOURCE_SHA. See the provenance and license manifests."
+          gh release upload "v$VERSION" --repo "$GITHUB_REPOSITORY" out/*
+          gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
+
+      - name: Finish a fully uploaded draft
+        if: steps.release.outputs.ready == 'true' && steps.release.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
